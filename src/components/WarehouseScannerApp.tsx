@@ -15,6 +15,7 @@ import {
   Layers,
   Lock,
   Minus,
+  Package,
   Plus,
   RefreshCw,
   Repeat,
@@ -40,10 +41,15 @@ import {
   soundSynthesizer,
 } from "@/lib/audioFeedback";
 import {
+  findProductByBarcode,
+  loadProductCatalog,
+} from "@/lib/productCatalog";
+import {
   clearAllScans,
   deleteScanRecord,
   exportScansToCSV,
   getAllScans,
+  saveAllScans,
   saveScanRecord,
 } from "@/lib/storage";
 import { syncToServer } from "@/lib/syncService";
@@ -52,6 +58,7 @@ import {
   WAREHOUSE_FORMATS,
   type BarcodeFormatFilter,
   type DecodedBarcodeItem,
+  type ProductInfo,
   type ScanMode,
   type ScanRecord,
   type SupportedBarcodeFormat,
@@ -63,12 +70,11 @@ const DEMO_BARCODES: Array<{
   rawValue: string;
   format: SupportedBarcodeFormat;
 }> = [
-  { rawValue: "8690504012345", format: "ean_13" },
-  { rawValue: "DEPO-RAF-A12-0048", format: "code_128" },
-  { rawValue: "PALET-2026-8841", format: "code_39" },
-  { rawValue: "https://depo.local/sku/90421", format: "qr_code" },
-  { rawValue: "86912348", format: "ean_8" },
-  { rawValue: "036000291452", format: "upc_a" },
+  { rawValue: "8696368011332", format: "ean_13" },
+  { rawValue: "8690632020297", format: "ean_13" },
+  { rawValue: "8690627023401", format: "ean_13" },
+  { rawValue: "90162602", format: "ean_8" },
+  { rawValue: "BARKOD-DISI-URUN-99", format: "code_128" },
 ];
 
 function createRecordId(): string {
@@ -78,12 +84,129 @@ function createRecordId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function ProductThumbnail({
+  src,
+  alt,
+  sizeClass = "h-14 w-14",
+}: {
+  src?: string;
+  alt: string;
+  sizeClass?: string;
+}) {
+  const [failedSrc, setFailedSrc] = useState<string | null>(null);
+
+  if (!src) return null;
+
+  if (failedSrc === src) {
+    return (
+      <div
+        className={`flex shrink-0 items-center justify-center rounded-xl border border-zinc-700 bg-zinc-800 text-zinc-400 ${sizeClass}`}
+      >
+        <Package className="h-5 w-5" />
+      </div>
+    );
+  }
+
+  return (
+    <img
+      src={src}
+      alt={alt}
+      loading="lazy"
+      onError={() => setFailedSrc(src)}
+      className={`shrink-0 rounded-xl border border-zinc-700 bg-white object-contain p-0.5 ${sizeClass}`}
+    />
+  );
+}
+
+function QuantityEditor({
+  quantity,
+  onAdjust,
+  onSetExact,
+  compact = false,
+}: {
+  quantity: number;
+  onAdjust: (delta: number) => void;
+  onSetExact: (nextQty: number) => void;
+  compact?: boolean;
+}) {
+  const [isEditing, setIsEditing] = useState(false);
+  const [draft, setDraft] = useState(String(quantity));
+
+  const btnSize = compact ? "h-10 w-10" : "h-11 w-10";
+  const inputSize = compact ? "h-10 w-14 text-base" : "h-11 w-16 text-lg";
+
+  return (
+    <div className="flex shrink-0 items-center gap-1">
+      <button
+        type="button"
+        aria-label="Adet azalt"
+        onClick={() => onAdjust(-1)}
+        disabled={quantity <= 1}
+        className={`flex items-center justify-center rounded-xl border border-zinc-700 bg-zinc-800 text-zinc-100 active:scale-95 disabled:opacity-40 ${btnSize}`}
+      >
+        <Minus className="h-4 w-4" />
+      </button>
+
+      <div className="flex flex-col items-center">
+        <input
+          type="number"
+          inputMode="numeric"
+          min={1}
+          aria-label="Doğrudan adet gir"
+          value={isEditing ? draft : String(quantity)}
+          onFocus={(e) => {
+            setIsEditing(true);
+            setDraft(String(quantity));
+            e.currentTarget.select();
+          }}
+          onChange={(e) => {
+            const raw = e.target.value;
+            setDraft(raw);
+            const parsed = parseInt(raw, 10);
+            if (!Number.isNaN(parsed) && parsed >= 1) {
+              onSetExact(parsed);
+            }
+          }}
+          onBlur={() => {
+            setIsEditing(false);
+            const parsed = parseInt(draft, 10);
+            if (!Number.isNaN(parsed) && parsed >= 1 && parsed !== quantity) {
+              onSetExact(parsed);
+            }
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.currentTarget.blur();
+            }
+          }}
+          className={`rounded-xl border border-zinc-700 bg-zinc-950 text-center font-mono font-black text-emerald-400 focus:border-emerald-400 focus:outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none ${inputSize}`}
+        />
+        {!compact && (
+          <span className="mt-0.5 text-[9px] font-semibold uppercase text-zinc-400">
+            Adet Gir
+          </span>
+        )}
+      </div>
+
+      <button
+        type="button"
+        aria-label="Adet artır"
+        onClick={() => onAdjust(1)}
+        className={`flex items-center justify-center rounded-xl bg-emerald-500 text-zinc-950 active:scale-95 ${btnSize}`}
+      >
+        <Plus className="h-4 w-4 stroke-[2.5]" />
+      </button>
+    </div>
+  );
+}
+
 export default function WarehouseScannerApp() {
   const [scans, setScans] = useState<ScanRecord[]>([]);
   const [formatFilter, setFormatFilter] = useState<BarcodeFormatFilter>("all");
   const [scanMode, setScanMode] = useState<ScanMode>("serial");
   const [muted, setMuted] = useState(false);
   const [isOnline, setIsOnline] = useState(true);
+  const [catalogCount, setCatalogCount] = useState(0);
 
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -97,6 +220,7 @@ export default function WarehouseScannerApp() {
   const scansRef = useRef<ScanRecord[]>([]);
   const scanModeRef = useRef<ScanMode>(scanMode);
   const mutedRef = useRef<boolean>(muted);
+  const catalogRef = useRef<Map<string, ProductInfo> | null>(null);
   const bannerTimerRef = useRef<number | null>(null);
   const demoIndexRef = useRef<number>(0);
 
@@ -118,11 +242,37 @@ export default function WarehouseScannerApp() {
     []
   );
 
-  // İlk yüklemede yerel depolamadan kayıtları getir
+  // İlk yüklemede yerel depolamadan kayıtları ve product.json kataloğunu getir
   useEffect(() => {
-    void getAllScans().then((loaded) => {
-      setScans(loaded);
-    });
+    let active = true;
+
+    void Promise.all([getAllScans(), loadProductCatalog()]).then(
+      ([loadedScans, catalog]) => {
+        if (!active) return;
+
+        catalogRef.current = catalog;
+        setCatalogCount(catalog.size);
+
+        let enrichedAny = false;
+        const enriched = loadedScans.map((record) => {
+          if (record.productName) return record;
+          const match = findProductByBarcode(record.barcode, catalog);
+          if (!match) return record;
+          enrichedAny = true;
+          return {
+            ...record,
+            productName: match.name,
+            productImage: match.picURL,
+          };
+        });
+
+        scansRef.current = enriched;
+        setScans(enriched);
+        if (enrichedAny) {
+          void saveAllScans(enriched);
+        }
+      }
+    );
 
     if (typeof window !== "undefined") {
       setIsOnline(window.navigator.onLine);
@@ -141,10 +291,15 @@ export default function WarehouseScannerApp() {
       window.addEventListener("online", handleOnline);
       window.addEventListener("offline", handleOffline);
       return () => {
+        active = false;
         window.removeEventListener("online", handleOnline);
         window.removeEventListener("offline", handleOffline);
       };
     }
+
+    return () => {
+      active = false;
+    };
   }, [showStatusBanner]);
 
   const handleBarcodeDetected = useCallback(
@@ -164,6 +319,7 @@ export default function WarehouseScannerApp() {
         return "duplicate";
       }
 
+      const product = findProductByBarcode(item.rawValue, catalogRef.current);
       const now = Date.now();
       let updatedRecord: ScanRecord;
       let nextList: ScanRecord[];
@@ -174,6 +330,8 @@ export default function WarehouseScannerApp() {
           quantity: existing.quantity + 1,
           timestamp: now,
           synced: false,
+          productName: existing.productName ?? product?.name,
+          productImage: existing.productImage ?? product?.picURL,
         };
         nextList = [
           updatedRecord,
@@ -187,6 +345,8 @@ export default function WarehouseScannerApp() {
           quantity: 1,
           timestamp: now,
           synced: false,
+          productName: product?.name,
+          productImage: product?.picURL,
         };
         nextList = [updatedRecord, ...currentScans];
       }
@@ -212,6 +372,9 @@ export default function WarehouseScannerApp() {
     torchOn,
     zoom,
     digitalZoomScale,
+    liveDetected,
+    isTriggerArmed,
+    triggerScan,
     toggleTorch,
     setZoom,
     restartCamera,
@@ -226,30 +389,41 @@ export default function WarehouseScannerApp() {
     soundSynthesizer.unlock();
   }, []);
 
+  const updateRecordQuantity = useCallback((id: string, nextQty: number) => {
+    const safeQty = Math.max(1, Math.floor(nextQty));
+    const target = scansRef.current.find((r) => r.id === id);
+    if (!target || target.quantity === safeQty) return;
+
+    const updated: ScanRecord = {
+      ...target,
+      quantity: safeQty,
+      timestamp: Date.now(),
+      synced: false,
+    };
+
+    const nextList = scansRef.current.map((r) => (r.id === id ? updated : r));
+    scansRef.current = nextList;
+    setScans(nextList);
+    void saveScanRecord(updated);
+  }, []);
+
   const handleAdjustQuantity = useCallback(
     (id: string, delta: number) => {
       soundSynthesizer.unlock();
       playClickTick(mutedRef.current);
-
       const target = scansRef.current.find((r) => r.id === id);
       if (!target) return;
-
-      const nextQty = Math.max(1, target.quantity + delta);
-      if (nextQty === target.quantity) return;
-
-      const updated: ScanRecord = {
-        ...target,
-        quantity: nextQty,
-        timestamp: Date.now(),
-        synced: false,
-      };
-
-      const nextList = scansRef.current.map((r) => (r.id === id ? updated : r));
-      scansRef.current = nextList;
-      setScans(nextList);
-      void saveScanRecord(updated);
+      updateRecordQuantity(id, Math.max(1, target.quantity + delta));
     },
-    []
+    [updateRecordQuantity]
+  );
+
+  const handleSetExactQuantity = useCallback(
+    (id: string, nextQty: number) => {
+      soundSynthesizer.unlock();
+      updateRecordQuantity(id, nextQty);
+    },
+    [updateRecordQuantity]
   );
 
   const handleDeleteRecord = useCallback((id: string) => {
@@ -302,6 +476,17 @@ export default function WarehouseScannerApp() {
     }
   }, [handleBarcodeDetected, triggerLaserFeedback]);
 
+  const handleTriggerButtonPress = useCallback(() => {
+    soundSynthesizer.unlock();
+    playClickTick(mutedRef.current);
+    triggerScan();
+  }, [triggerScan]);
+
+  const liveProduct = useMemo(() => {
+    if (!liveDetected || catalogCount === 0) return null;
+    return findProductByBarcode(liveDetected.rawValue, catalogRef.current);
+  }, [liveDetected, catalogCount]);
+
   const latestScan = scans[0] ?? null;
 
   const { totalUnits, unsyncedCount } = useMemo(() => {
@@ -319,8 +504,11 @@ export default function WarehouseScannerApp() {
     if (!q) return scans;
     return scans.filter((item) => {
       const formatLabel = (FORMAT_LABELS[item.format] ?? item.format).toLowerCase();
+      const productName = (item.productName ?? "").toLowerCase();
       return (
-        item.barcode.toLowerCase().includes(q) || formatLabel.includes(q)
+        item.barcode.toLowerCase().includes(q) ||
+        formatLabel.includes(q) ||
+        productName.includes(q)
       );
     });
   }, [scans, searchQuery]);
@@ -330,10 +518,12 @@ export default function WarehouseScannerApp() {
       ? "h-1 bg-emerald-400 shadow-[0_0_20px_5px_rgba(52,211,153,0.95)] scale-y-125"
       : laserState === "duplicate"
         ? "h-1 bg-amber-400 shadow-[0_0_18px_4px_rgba(251,191,36,0.95)]"
-        : "h-[2px] bg-red-500 shadow-[0_0_12px_2px_rgba(239,68,68,0.85)]";
+        : liveDetected
+          ? "h-[3px] bg-emerald-400 shadow-[0_0_14px_3px_rgba(52,211,153,0.85)]"
+          : "h-[2px] bg-red-500 shadow-[0_0_12px_2px_rgba(239,68,68,0.85)]";
 
   const cornerBorderClasses =
-    laserState === "success"
+    laserState === "success" || liveDetected
       ? "border-emerald-400"
       : laserState === "duplicate"
         ? "border-amber-400"
@@ -408,7 +598,7 @@ export default function WarehouseScannerApp() {
               type="button"
               onClick={handleSimulateScan}
               className="flex items-center gap-1 rounded-full border border-zinc-700 bg-zinc-900 px-2.5 py-1 text-xs font-medium text-zinc-200 active:scale-95"
-              title="Kamera olmadan örnek barkod okumasını test et"
+              title="Kamera olmadan örnek ürün barkodunu test et"
             >
               <Sparkles className="h-3.5 w-3.5 text-amber-400" />
               <span>Test Okut</span>
@@ -496,7 +686,7 @@ export default function WarehouseScannerApp() {
         />
 
         {/* Merkez %85 x %25 ROI Kutusu + Dış Koyu Yarı Saydam Maske */}
-        <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center overflow-hidden">
+        <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center overflow-hidden pb-24">
           <div
             ref={roiRef}
             className="relative h-[25%] w-[85%] max-w-2xl rounded-2xl shadow-[0_0_0_9999px_rgba(0,0,0,0.68)]"
@@ -525,22 +715,48 @@ export default function WarehouseScannerApp() {
             {/* Aktif ROI Etiketi */}
             <div className="absolute top-2 left-3 rounded bg-black/55 px-1.5 py-0.5 text-[10px] font-medium tracking-wide text-zinc-300 backdrop-blur-xs">
               {formatFilter === "all"
-                ? "ROI %85×%25"
+                ? "TUŞLA OKUMA MODU"
                 : `${FORMAT_LABELS[formatFilter]} KİLİTLİ`}
             </div>
           </div>
 
-          {/* Alt Hedef İpucu */}
-          <div className="mt-4 flex items-center gap-1.5 rounded-full border border-zinc-800/80 bg-zinc-950/80 px-3.5 py-1 text-xs font-medium text-zinc-200 backdrop-blur-sm">
-            {laserState === "success" ? (
-              <>
-                <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
-                <span className="text-emerald-300">Barkod Okundu!</span>
-              </>
-            ) : (
-              <span>Barkodu çizgiye hizalayın</span>
-            )}
-          </div>
+          {/* Canlı Algılanan Ürün Önizlemesi / Alt Hedef İpucu */}
+          {liveDetected ? (
+            <div className="mt-3 flex max-w-[85%] items-center gap-2.5 rounded-2xl border border-emerald-400/50 bg-zinc-950/90 px-3 py-2 text-xs shadow-xl backdrop-blur-md">
+              {liveProduct?.picURL && (
+                <ProductThumbnail
+                  src={liveProduct.picURL}
+                  alt={liveProduct.name}
+                  sizeClass="h-10 w-10"
+                />
+              )}
+              <div className="min-w-0">
+                {liveProduct && (
+                  <p className="truncate font-bold text-zinc-50">
+                    {liveProduct.name}
+                  </p>
+                )}
+                <p className="font-mono text-[11px] font-semibold text-emerald-300">
+                  {liveDetected.rawValue} • Okutmak için tuşa basın
+                </p>
+              </div>
+            </div>
+          ) : (
+            <div className="mt-3 flex items-center gap-1.5 rounded-full border border-zinc-800/80 bg-zinc-950/85 px-3.5 py-1.5 text-xs font-medium text-zinc-200 backdrop-blur-sm">
+              {laserState === "success" ? (
+                <>
+                  <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
+                  <span className="text-emerald-300">Barkod Okundu!</span>
+                </>
+              ) : isTriggerArmed ? (
+                <span className="animate-pulse text-amber-300">
+                  Barkod aranıyor... Barkodu çizgiye tutun
+                </span>
+              ) : (
+                <span>Barkodu çizgiye hizalayın ve BARKOD OKUT tuşuna basın</span>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Anlık Durum / Mükerrer Barkod Uyarı Bandı */}
@@ -568,7 +784,7 @@ export default function WarehouseScannerApp() {
 
         {/* Kamera Başlatılıyor veya Hata Durumu Katmanı */}
         {(isStarting || error) && (
-          <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-zinc-950/90 p-6 text-center backdrop-blur-sm">
+          <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-zinc-950/90 p-6 pb-28 text-center backdrop-blur-sm">
             {error ? (
               <div className="flex max-w-sm flex-col items-center gap-3 rounded-2xl border border-zinc-800 bg-zinc-900 p-5 shadow-2xl">
                 <div className="flex h-12 w-12 items-center justify-center rounded-full bg-rose-500/15 text-rose-400">
@@ -611,15 +827,38 @@ export default function WarehouseScannerApp() {
           </div>
         )}
 
-        {/* BAŞPARMAK DOSTU DONANIM VE OKUMA MODU KONTROLLERİ */}
-        <div className="absolute inset-x-0 bottom-0 z-20 flex flex-col gap-2 bg-gradient-to-t from-zinc-950 via-zinc-950/85 to-transparent px-3 pt-6 pb-2.5">
+        {/* BAŞPARMAK DOSTU TETİK BUTONU + DONANIM VE MOD KONTROLLERİ */}
+        <div className="absolute inset-x-0 bottom-0 z-20 flex flex-col gap-2 bg-gradient-to-t from-zinc-950 via-zinc-950/90 to-transparent px-3 pt-6 pb-2.5">
+          {/* BÜYÜK BARKOD OKUT BUTONU */}
+          <button
+            type="button"
+            onClick={handleTriggerButtonPress}
+            disabled={!isActive}
+            className={`flex w-full items-center justify-center gap-2.5 rounded-2xl py-3.5 text-sm font-black tracking-wide transition-all active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-45 ${
+              isTriggerArmed
+                ? "animate-pulse border-2 border-amber-300 bg-amber-400 text-zinc-950 shadow-[0_0_24px_rgba(251,191,36,0.45)]"
+                : liveDetected
+                  ? "bg-emerald-400 text-zinc-950 shadow-[0_0_25px_rgba(52,211,153,0.55)] ring-2 ring-emerald-300/70"
+                  : "bg-emerald-500 text-zinc-950 shadow-lg"
+            }`}
+          >
+            <ScanBarcode className="h-5 w-5 stroke-[2.5]" />
+            <span>
+              {isTriggerArmed
+                ? "ARANİYOR... (İPTAL ET)"
+                : liveDetected
+                  ? "BARKOD OKUT (+1)"
+                  : "BARKOD OKUT"}
+            </span>
+          </button>
+
           <div className="flex items-center justify-between gap-2">
             {/* Okuma Modu Geçiş Anahtarı */}
             <div className="flex rounded-xl border border-zinc-800 bg-zinc-900/95 p-1">
               <button
                 type="button"
                 onClick={() => setScanMode("serial")}
-                className={`flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-bold transition-colors active:scale-95 ${
+                className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-bold transition-colors active:scale-95 ${
                   scanMode === "serial"
                     ? "bg-emerald-500 text-zinc-950"
                     : "text-zinc-400 hover:text-zinc-200"
@@ -631,7 +870,7 @@ export default function WarehouseScannerApp() {
               <button
                 type="button"
                 onClick={() => setScanMode("single")}
-                className={`flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-bold transition-colors active:scale-95 ${
+                className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-bold transition-colors active:scale-95 ${
                   scanMode === "single"
                     ? "bg-amber-400 text-zinc-950"
                     : "text-zinc-400 hover:text-zinc-200"
@@ -647,7 +886,7 @@ export default function WarehouseScannerApp() {
               type="button"
               onClick={() => void toggleTorch()}
               disabled={!hasTorch || !isActive}
-              className={`flex items-center gap-1.5 rounded-xl border px-4 py-2.5 text-xs font-bold transition-all active:scale-95 ${
+              className={`flex items-center gap-1.5 rounded-xl border px-3.5 py-2 text-xs font-bold transition-all active:scale-95 ${
                 torchOn
                   ? "border-amber-300 bg-amber-400 text-zinc-950 shadow-[0_0_15px_rgba(251,191,36,0.4)]"
                   : hasTorch && isActive
@@ -702,64 +941,65 @@ export default function WarehouseScannerApp() {
         </div>
       </main>
 
-      {/* ALT CANLI OKUMA KARTI & ÇEKMECE ÖZET ÇUBUĞU */}
+      {/* ALT CANLI OKUMA KARTI & DOĞRUDAN ADET GİRİŞİ & ÇEKMECE */}
       <footer className="z-20 flex flex-col border-t border-zinc-800 bg-zinc-950 px-3 pt-2.5 pb-3">
         {latestScan ? (
-          <div className="flex items-center justify-between gap-3 rounded-2xl border border-zinc-800 bg-zinc-900 p-3 shadow-lg">
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-1.5">
-                <span className="rounded bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-bold text-emerald-300">
-                  {FORMAT_LABELS[latestScan.format] ?? latestScan.format}
-                </span>
-                <span className="text-[11px] text-zinc-400">
-                  {new Date(latestScan.timestamp).toLocaleTimeString("tr-TR")}
-                </span>
-                {latestScan.synced ? (
-                  <Cloud className="h-3.5 w-3.5 text-emerald-400" />
-                ) : (
-                  <CloudOff className="h-3.5 w-3.5 text-amber-400" />
+          <div className="flex items-center justify-between gap-2.5 rounded-2xl border border-zinc-800 bg-zinc-900 p-2.5 shadow-lg">
+            <div className="flex min-w-0 flex-1 items-center gap-2.5">
+              {latestScan.productImage && (
+                <ProductThumbnail
+                  src={latestScan.productImage}
+                  alt={latestScan.productName ?? latestScan.barcode}
+                  sizeClass="h-14 w-14"
+                />
+              )}
+
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-1.5">
+                  <span className="rounded bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-bold text-emerald-300">
+                    {FORMAT_LABELS[latestScan.format] ?? latestScan.format}
+                  </span>
+                  <span className="text-[11px] text-zinc-400">
+                    {new Date(latestScan.timestamp).toLocaleTimeString("tr-TR")}
+                  </span>
+                  {latestScan.synced ? (
+                    <Cloud className="h-3.5 w-3.5 text-emerald-400" />
+                  ) : (
+                    <CloudOff className="h-3.5 w-3.5 text-amber-400" />
+                  )}
+                </div>
+
+                {latestScan.productName && (
+                  <p className="mt-0.5 line-clamp-1 text-sm font-bold text-zinc-50">
+                    {latestScan.productName}
+                  </p>
                 )}
+
+                <p
+                  className={`truncate font-mono font-extrabold tracking-tight ${
+                    latestScan.productName
+                      ? "text-xs text-zinc-400"
+                      : "mt-1 text-base text-zinc-50"
+                  }`}
+                >
+                  {latestScan.barcode}
+                </p>
               </div>
-              <p className="mt-1 truncate font-mono text-lg font-extrabold tracking-tight text-zinc-50">
-                {latestScan.barcode}
-              </p>
             </div>
 
-            {/* Büyük Başparmak Adet Kontrolleri */}
-            <div className="flex shrink-0 items-center gap-1.5">
-              <button
-                type="button"
-                aria-label="Adet azalt"
-                onClick={() => handleAdjustQuantity(latestScan.id, -1)}
-                disabled={latestScan.quantity <= 1}
-                className="flex h-11 w-11 items-center justify-center rounded-xl border border-zinc-700 bg-zinc-800 text-zinc-100 active:scale-95 disabled:opacity-40"
-              >
-                <Minus className="h-5 w-5" />
-              </button>
-
-              <div className="flex min-w-11 flex-col items-center justify-center px-1">
-                <span className="font-mono text-xl font-black text-emerald-400">
-                  {latestScan.quantity}
-                </span>
-                <span className="text-[9px] font-semibold uppercase text-zinc-400">
-                  Adet
-                </span>
-              </div>
-
-              <button
-                type="button"
-                aria-label="Adet artır"
-                onClick={() => handleAdjustQuantity(latestScan.id, 1)}
-                className="flex h-11 w-11 items-center justify-center rounded-xl bg-emerald-500 text-zinc-950 active:scale-95"
-              >
-                <Plus className="h-5 w-5 stroke-[2.5]" />
-              </button>
+            {/* Basarak Artırma + Doğrudan Adet Yazma + Sil */}
+            <div className="flex shrink-0 items-start gap-1">
+              <QuantityEditor
+                quantity={latestScan.quantity}
+                onAdjust={(delta) => handleAdjustQuantity(latestScan.id, delta)}
+                onSetExact={(qty) => handleSetExactQuantity(latestScan.id, qty)}
+              />
 
               <button
                 type="button"
                 aria-label="Kaydı sil"
                 onClick={() => handleDeleteRecord(latestScan.id)}
-                className="ml-0.5 flex h-11 w-10 items-center justify-center rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-400 active:scale-95"
+                className="flex h-11 w-9 items-center justify-center rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-400 active:scale-95"
               >
                 <Trash2 className="h-4 w-4" />
               </button>
@@ -767,7 +1007,10 @@ export default function WarehouseScannerApp() {
           </div>
         ) : (
           <div className="flex items-center justify-between rounded-2xl border border-dashed border-zinc-800 bg-zinc-900/50 px-4 py-3 text-xs text-zinc-400">
-            <span>Henüz barkod okutulmadı. Kırmızı çizgiyi barkoda tutun.</span>
+            <span>
+              Barkodu çizgiye hizalayın ve <strong>BARKOD OKUT</strong> tuşuna
+              basın.
+            </span>
             <ScanBarcode className="h-5 w-5 shrink-0 text-zinc-600" />
           </div>
         )}
@@ -832,7 +1075,7 @@ export default function WarehouseScannerApp() {
                 type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Barkod ara..."
+                placeholder="Barkod veya ürün adı ara..."
                 className="w-full rounded-xl border border-zinc-800 bg-zinc-900 py-2.5 pr-9 pl-9 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-emerald-500 focus:outline-none"
               />
               {searchQuery && (
@@ -856,7 +1099,7 @@ export default function WarehouseScannerApp() {
                 <p>
                   {scans.length === 0
                     ? "Henüz okutulmuş ürün bulunmuyor."
-                    : "Arama kriterine uygun barkod bulunamadı."}
+                    : "Arama kriterine uygun ürün bulunamadı."}
                 </p>
               </div>
             ) : (
@@ -864,56 +1107,65 @@ export default function WarehouseScannerApp() {
                 {filteredScans.map((item) => (
                   <li
                     key={item.id}
-                    className="flex items-center justify-between gap-3 rounded-2xl border border-zinc-800 bg-zinc-900 p-3"
+                    className="flex items-center justify-between gap-2.5 rounded-2xl border border-zinc-800 bg-zinc-900 p-3"
                   >
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-2">
-                        <span className="rounded bg-zinc-800 px-1.5 py-0.5 text-[10px] font-bold text-emerald-300">
-                          {FORMAT_LABELS[item.format] ?? item.format}
-                        </span>
-                        <span className="text-[11px] text-zinc-400">
-                          {new Date(item.timestamp).toLocaleString("tr-TR")}
-                        </span>
-                        {item.synced ? (
-                          <span className="inline-flex items-center gap-1 text-[10px] font-medium text-emerald-400">
-                            <Cloud className="h-3 w-3" />
-                            Eşitlendi
+                    <div className="flex min-w-0 flex-1 items-center gap-2.5">
+                      {item.productImage && (
+                        <ProductThumbnail
+                          src={item.productImage}
+                          alt={item.productName ?? item.barcode}
+                          sizeClass="h-12 w-12"
+                        />
+                      )}
+
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className="rounded bg-zinc-800 px-1.5 py-0.5 text-[10px] font-bold text-emerald-300">
+                            {FORMAT_LABELS[item.format] ?? item.format}
                           </span>
-                        ) : (
-                          <span className="inline-flex items-center gap-1 text-[10px] font-medium text-amber-400">
-                            <CloudOff className="h-3 w-3" />
-                            Yerel
+                          <span className="text-[11px] text-zinc-400">
+                            {new Date(item.timestamp).toLocaleTimeString("tr-TR")}
                           </span>
+                          {item.synced ? (
+                            <span className="inline-flex items-center gap-1 text-[10px] font-medium text-emerald-400">
+                              <Cloud className="h-3 w-3" />
+                              Eşitlendi
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 text-[10px] font-medium text-amber-400">
+                              <CloudOff className="h-3 w-3" />
+                              Yerel
+                            </span>
+                          )}
+                        </div>
+
+                        {item.productName && (
+                          <p className="mt-0.5 line-clamp-1 text-sm font-bold text-zinc-50">
+                            {item.productName}
+                          </p>
                         )}
+
+                        <p
+                          className={`truncate font-mono font-bold ${
+                            item.productName
+                              ? "text-xs text-zinc-400"
+                              : "mt-1 text-base text-zinc-50"
+                          }`}
+                        >
+                          {item.barcode}
+                        </p>
                       </div>
-                      <p className="mt-1 truncate font-mono text-base font-bold text-zinc-50">
-                        {item.barcode}
-                      </p>
                     </div>
 
-                    <div className="flex shrink-0 items-center gap-1.5">
-                      <button
-                        type="button"
-                        aria-label="Adet azalt"
-                        onClick={() => handleAdjustQuantity(item.id, -1)}
-                        disabled={item.quantity <= 1}
-                        className="flex h-10 w-10 items-center justify-center rounded-xl border border-zinc-700 bg-zinc-800 text-zinc-100 active:scale-95 disabled:opacity-40"
-                      >
-                        <Minus className="h-4 w-4" />
-                      </button>
-
-                      <span className="min-w-9 text-center font-mono text-lg font-extrabold text-emerald-400">
-                        {item.quantity}
-                      </span>
-
-                      <button
-                        type="button"
-                        aria-label="Adet artır"
-                        onClick={() => handleAdjustQuantity(item.id, 1)}
-                        className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-500 text-zinc-950 active:scale-95"
-                      >
-                        <Plus className="h-4 w-4 stroke-[2.5]" />
-                      </button>
+                    <div className="flex shrink-0 items-center gap-1">
+                      <QuantityEditor
+                        compact
+                        quantity={item.quantity}
+                        onAdjust={(delta) => handleAdjustQuantity(item.id, delta)}
+                        onSetExact={(qty) =>
+                          handleSetExactQuantity(item.id, qty)
+                        }
+                      />
 
                       <button
                         type="button"

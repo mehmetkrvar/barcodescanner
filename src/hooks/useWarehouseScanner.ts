@@ -49,13 +49,17 @@ export interface UseWarehouseScannerReturn {
   zoom: number;
   hasHardwareZoom: boolean;
   digitalZoomScale: number;
+  liveDetected: DecodedBarcodeItem | null;
+  isTriggerArmed: boolean;
+  triggerScan: () => void;
   toggleTorch: () => Promise<void>;
   setZoom: (value: number) => Promise<void>;
   restartCamera: () => Promise<void>;
   triggerLaserFeedback: (state: "success" | "duplicate") => void;
 }
 
-const DEBOUNCE_MS = 1500;
+const LIVE_DETECT_HOLD_MS = 600;
+const TRIGGER_ARM_TIMEOUT_MS = 4000;
 const LASER_FEEDBACK_MS = 150;
 
 export function useWarehouseScanner({
@@ -79,7 +83,13 @@ export function useWarehouseScanner({
   const pausedRef = useRef<boolean>(paused);
   const onDetectedRef = useRef(onDetected);
 
-  const cooldownMapRef = useRef<Map<string, number>>(new Map());
+  const liveDetectedRef = useRef<{
+    item: DecodedBarcodeItem;
+    seenAt: number;
+  } | null>(null);
+  const triggerArmedRef = useRef<boolean>(false);
+  const triggerTimeoutRef = useRef<number | null>(null);
+
   const frameCounterRef = useRef<{ count: number; windowStart: number }>({
     count: 0,
     windowStart: 0,
@@ -102,10 +112,29 @@ export function useWarehouseScanner({
   const [torchOn, setTorchOn] = useState(false);
   const [zoom, setZoomState] = useState(1);
   const [hasHardwareZoom, setHasHardwareZoom] = useState(false);
+  const [liveDetected, setLiveDetected] = useState<DecodedBarcodeItem | null>(
+    null
+  );
+  const [isTriggerArmed, setIsTriggerArmed] = useState(false);
 
   formatFilterRef.current = formatFilter;
   pausedRef.current = paused;
   onDetectedRef.current = onDetected;
+
+  const disarmTrigger = useCallback(() => {
+    if (triggerTimeoutRef.current !== null) {
+      window.clearTimeout(triggerTimeoutRef.current);
+      triggerTimeoutRef.current = null;
+    }
+    triggerArmedRef.current = false;
+    setIsTriggerArmed(false);
+  }, []);
+
+  useEffect(() => {
+    if (paused) {
+      disarmTrigger();
+    }
+  }, [paused, disarmTrigger]);
 
   const triggerLaserFeedback = useCallback(
     (state: "success" | "duplicate") => {
@@ -447,34 +476,38 @@ export function useWarehouseScanner({
           }));
         }
 
-        if (data.barcodes.length > 0 && !pausedRef.current) {
-          // Eski bekleme kayıtlarını temizle
-          if (cooldownMapRef.current.size > 40) {
-            for (const [key, ts] of cooldownMapRef.current.entries()) {
-              if (now - ts > 10000) {
-                cooldownMapRef.current.delete(key);
+        if (!pausedRef.current) {
+          if (data.barcodes.length > 0) {
+            const detectedItem: DecodedBarcodeItem = {
+              rawValue: data.barcodes[0].rawValue,
+              format: data.barcodes[0].format as SupportedBarcodeFormat,
+            };
+
+            liveDetectedRef.current = { item: detectedItem, seenAt: now };
+            setLiveDetected((prev) =>
+              prev &&
+              prev.rawValue === detectedItem.rawValue &&
+              prev.format === detectedItem.format
+                ? prev
+                : detectedItem
+            );
+
+            // Tuşla okutma (Trigger Mode) bekleniyorsa ilk algılanan barkodu kaydet
+            if (triggerArmedRef.current) {
+              disarmTrigger();
+              const outcome = onDetectedRef.current(detectedItem);
+              if (outcome === "accepted") {
+                triggerLaserFeedback("success");
+              } else if (outcome === "duplicate") {
+                triggerLaserFeedback("duplicate");
               }
             }
-          }
-
-          for (const item of data.barcodes) {
-            const lastSeen = cooldownMapRef.current.get(item.rawValue);
-            if (lastSeen !== undefined && now - lastSeen < DEBOUNCE_MS) {
-              continue;
-            }
-
-            cooldownMapRef.current.set(item.rawValue, now);
-            const outcome = onDetectedRef.current({
-              rawValue: item.rawValue,
-              format: item.format as SupportedBarcodeFormat,
-            });
-
-            if (outcome === "accepted") {
-              triggerLaserFeedback("success");
-            } else if (outcome === "duplicate") {
-              triggerLaserFeedback("duplicate");
-            }
-            break;
+          } else if (
+            liveDetectedRef.current &&
+            now - liveDetectedRef.current.seenAt > LIVE_DETECT_HOLD_MS
+          ) {
+            liveDetectedRef.current = null;
+            setLiveDetected(null);
           }
         }
       }
@@ -496,11 +529,43 @@ export function useWarehouseScanner({
       if (lastLaserTimerRef.current !== null) {
         window.clearTimeout(lastLaserTimerRef.current);
       }
+      disarmTrigger();
       stopCameraStream();
       worker.terminate();
       workerRef.current = null;
     };
-  }, [startCamera, stopCameraStream, triggerLaserFeedback]);
+  }, [disarmTrigger, startCamera, stopCameraStream, triggerLaserFeedback]);
+
+  const triggerScan = useCallback(() => {
+    if (pausedRef.current) return;
+
+    // Halihazırda bekleniyorsa ikinci basışta aramayı iptal et
+    if (triggerArmedRef.current) {
+      disarmTrigger();
+      return;
+    }
+
+    const current = liveDetectedRef.current;
+    const now = performance.now();
+
+    // Lazer altında canlı algılanmış bir barkod varsa 0 ms gecikmeyle anında okut
+    if (current && now - current.seenAt <= LIVE_DETECT_HOLD_MS) {
+      const outcome = onDetectedRef.current(current.item);
+      if (outcome === "accepted") {
+        triggerLaserFeedback("success");
+      } else if (outcome === "duplicate") {
+        triggerLaserFeedback("duplicate");
+      }
+      return;
+    }
+
+    // Barkod henüz kadrajda değilse ilk girecek barkodu yakalamak için tetikle
+    triggerArmedRef.current = true;
+    setIsTriggerArmed(true);
+    triggerTimeoutRef.current = window.setTimeout(() => {
+      disarmTrigger();
+    }, TRIGGER_ARM_TIMEOUT_MS);
+  }, [disarmTrigger, triggerLaserFeedback]);
 
   const toggleTorch = useCallback(async () => {
     const track = trackRef.current;
@@ -556,6 +621,9 @@ export function useWarehouseScanner({
     zoom,
     hasHardwareZoom,
     digitalZoomScale,
+    liveDetected,
+    isTriggerArmed,
+    triggerScan,
     toggleTorch,
     setZoom,
     restartCamera: startCamera,

@@ -27,6 +27,12 @@ export const FORMAT_LABELS: Record<BarcodeFormatFilter, string> = {
   upc_a: "UPC-A",
 };
 
+export interface ProductInfo {
+  id: string;
+  name: string;
+  picURL?: string;
+}
+
 export interface ScanRecord {
   id: string;
   barcode: string;
@@ -34,6 +40,8 @@ export interface ScanRecord {
   quantity: number;
   timestamp: number;
   synced: boolean;
+  productName?: string;
+  productImage?: string;
 }
 
 export type ScanMode = "serial" | "single";

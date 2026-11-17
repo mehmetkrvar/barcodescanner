@@ -195,14 +195,16 @@ function escapeCsvCell(value: string): string {
 export function exportScansToCSV(scans: ScanRecord[]): void {
   if (typeof window === "undefined" || scans.length === 0) return;
 
-  const header = "ID;Barkod;Format;Adet;Tarih_Saat;Senkron_Durumu";
+  const header = "ID;Barkod;Urun_Adi;Format;Adet;Tarih_Saat;Senkron_Durumu";
   const rows = scans.map((scan) => {
     const formattedDate = new Date(scan.timestamp).toLocaleString("tr-TR");
     const formatLabel = FORMAT_LABELS[scan.format] ?? scan.format;
     const syncStatus = scan.synced ? "Eşitlendi" : "Bekliyor";
+    const productName = scan.productName ?? "-";
     return [
       escapeCsvCell(scan.id),
       escapeCsvCell(scan.barcode),
+      escapeCsvCell(productName),
       escapeCsvCell(formatLabel),
       String(scan.quantity),
       escapeCsvCell(formattedDate),
